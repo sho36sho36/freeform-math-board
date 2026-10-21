@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#f7f8fc">
+<title>Math Board — 手書き数式ホワイトボード</title>
+<style>
+:root{--ink:#202638;--muted:#6b7280;--line:#e4e7ef;--accent:#5368d8;--paper:#fff}
+*{box-sizing:border-box}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink);background:#f7f8fc}
+body{display:flex;flex-direction:column;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}
+header{display:flex;align-items:center;gap:8px;padding:10px 12px;background:#ffffffed;border-bottom:1px solid var(--line);z-index:5;flex-wrap:wrap}
+.brand{font-weight:800;letter-spacing:-.03em;margin-right:auto;white-space:nowrap}.brand span{color:var(--accent)}
+button,.filelabel{font:inherit;border:1px solid var(--line);background:white;border-radius:10px;padding:8px 10px;min-height:38px;cursor:pointer;color:var(--ink);display:inline-flex;align-items:center;justify-content:center;gap:6px;white-space:nowrap}
+button:active,.filelabel:active{transform:translateY(1px)}button.active{background:#e9edff;border-color:#aab5ff;color:#3145b8}button:disabled{opacity:.4;cursor:default}
+.toolgroup{display:flex;gap:5px;align-items:center}
+main{position:relative;flex:1;min-height:0}
+#board{display:block;width:100%;height:100%;touch-action:none;background:#fff;cursor:crosshair}
+#status{position:absolute;left:12px;bottom:12px;max-width:min(90%,520px);background:#ffffffed;border:1px solid var(--line);border-radius:12px;padding:8px 12px;font-size:13px;color:var(--muted);box-shadow:0 4px 18px #2026380b;pointer-events:none}
+#status strong{color:var(--ink)}
+#help{position:absolute;right:12px;bottom:12px;max-width:240px;background:#ffffffed;border:1px solid var(--line);border-radius:12px;padding:10px 12px;font-size:12px;line-height:1.5;color:var(--muted);pointer-events:none}
+#zoom{position:absolute;right:12px;top:12px;display:flex;gap:5px}
+#zoom button{min-width:40px}
+#modelNotice{position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:#ffffffd9;padding:24px;z-index:4}
+#modelNotice .panel{max-width:520px;background:white;border:1px solid var(--line);border-radius:18px;padding:22px;box-shadow:0 16px 50px #20263818}
+#modelNotice h2{margin:0 0 8px;font-size:20px}#modelNotice p{line-height:1.6;color:var(--muted);font-size:14px}
+#modelNotice button{background:var(--accent);color:white;border-color:var(--accent)}
+footer{font-size:11px;color:var(--muted);padding:5px 12px;background:#fff;border-top:1px solid var(--line)}
+@media(max-width:700px){header{gap:5px;padding:7px}.brand{width:100%;margin-bottom:2px}button,.filelabel{padding:7px 9px;min-height:36px;font-size:13px}.toolgroup{gap:4px}#help{display:none}#status{font-size:12px;max-width:calc(100% - 24px)}}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">✍️ Math <span>Board</span></div>
+  <div class="toolgroup" aria-label="ツール">
+    <button id="penBtn" class="active" title="ペン">✏️ ペン</button>
+    <button id="eraseBtn" title="消しゴム">🧽 消しゴム</button>
+    <button id="handBtn" title="キャンバス移動">✋ 移動</button>
+  </div>
+  <div class="toolgroup">
+    <button id="undoBtn" title="元に戻す" disabled>↶</button>
+    <button id="redoBtn" title="やり直す" disabled>↷</button>
+    <button id="clearBtn">全消去</button>
+  </div>
+  <div class="toolgroup">
+    <button id="saveBtn">保存</button>
+    <button id="loadBtn">読込</button>
+    <button id="exportBtn">JSON書出</button>
+    <label class="filelabel" for="importFile">JSON読込</label>
+    <input id="importFile" type="file" accept="application/json,.json" hidden>
+  </div>
+</header>
+<main>
+  <canvas id="board"></canvas>
+  <div id="zoom"><button id="zoomOut" aria-label="縮小">−</button><button id="zoomReset">100%</button><button id="zoomIn" aria-label="拡大">＋</button></div>
+  <div id="status"><strong>準備中…</strong> 認識エンジンを読み込んでいます</div>
+  <div id="help">数式をひとまとまりで書き、少し待つと自動認識します。<br>マウスホイール／2本指で拡大縮小、移動ツールでキャンバスを動かせます。</div>
+  <div id="modelNotice"><div class="panel"><h2>認識モデルを読み込めません</h2><p id="modelError">モデルファイルの場所を確認してください。</p><p>READMEの「モデルファイルの準備」を確認して、必要なファイルを <code>models/comer/</code> に配置してから再読み込みしてください。</p><button onclick="location.reload()">再読み込み</button></div></div>
+</main>
+<footer>手書き認識は端末内で処理します。認識結果は誤ることがあるため、計算結果を確認してください。</footer>
+<script type="module">
+const $ = id => document.getElementById(id);
+const canvas = $("board"), ctx = canvas.getContext("2d");
+const MODEL_BASE = new URL("./models/comer/", location.href).href;
+let engine = null, vocab = null, engineReady = false;
+let strokes = [], answers = [], undoStack = [], redoStack = [];
+let current = null, tool = "pen", scale = 1, offsetX = 0, offsetY = 0;
+let pointerMap = new Map(), pinchStart = null, lastPoint = null, recognitionTimer = null, generation = 0;
+let boardWidth = 0, boardHeight = 0;
+const COLORS = {ink:"#202638", answer:"#2b9a65", pending:"#8a91a5"};
+
+function setStatus(html){ $("status").innerHTML = html; }
+function resize(){
+  const rect = canvas.getBoundingClientRect(), dpr = Math.max(1, Math.min(3, devicePixelRatio || 1));
+  boardWidth = rect.width; boardHeight = rect.height;
+  canvas.width = Math.round(rect.width*dpr); canvas.height = Math.round(rect.height*dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0); draw();
+}
+new ResizeObserver(resize).observe(canvas);
+
+function screenToWorld(x,y){return {x:(x-offsetX)/scale,y:(y-offsetY)/scale};}
+function worldToScreen(x,y){return {x:x*scale+offsetX,y:y*scale+offsetY};}
+function saveHistory(){
+  undoStack.push(JSON.stringify({strokes,answers,scale,offsetX,offsetY}));
+  if(undoStack.length>60) undoStack.shift();
+  redoStack=[]; updateHistoryButtons();
+}
+function restoreSnapshot(s){
+  const d=JSON.parse(s); strokes=d.strokes||[]; answers=d.answers||[];
+  scale=d.scale||1;offsetX=d.offsetX||0;offsetY=d.offsetY||0;current=null;draw();updateHistoryButtons();
+}
+function updateHistoryButtons(){$("undoBtn").disabled=!undoStack.length;$("redoBtn").disabled=!redoStack.length;}
+function undo(){if(!undoStack.length)return;redoStack.push(JSON.stringify({strokes,answers,scale,offsetX,offsetY}));restoreSnapshot(undoStack.pop());updateHistoryButtons();}
+function redo(){if(!redoStack.length)return;undoStack.push(JSON.stringify({strokes,answers,scale,offsetX,offsetY}));restoreSnapshot(redoStack.pop());updateHistoryButtons();}
+function setTool(t){tool=t;for(const [id,name] of [["penBtn","pen"],["eraseBtn","erase"],["handBtn","hand"]])$(id).classList.toggle("active",t===name);canvas.style.cursor=t==="hand"?"grab":t==="erase"?"cell":"crosshair";}
+function draw(){
+  const dpr=canvas.width/(boardWidth||1);ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,boardWidth,boardHeight);ctx.fillStyle="#fff";ctx.fillRect(0,0,boardWidth,boardHeight);
+  // subtle infinite graph paper
+  const step=28*scale;
+  if(step>8){ctx.beginPath();ctx.strokeStyle="#edf0f6";ctx.lineWidth=1;let sx=((offsetX%step)+step)%step,sy=((offsetY%step)+step)%step;
+    for(let x=sx;x<boardWidth;x+=step){ctx.moveTo(x,0);ctx.lineTo(x,boardHeight)}
+    for(let y=sy;y<boardHeight;y+=step){ctx.moveTo(0,y);ctx.lineTo(boardWidth,y)}ctx.stroke();}
+  ctx.save();ctx.translate(offsetX,offsetY);ctx.scale(scale,scale);
+  for(const s of strokes) drawStroke(s);
+  if(current)drawStroke(current);
+  ctx.restore();
+  for(const a of answers){const p=worldToScreen(a.x,a.y);ctx.save();ctx.font=`600 ${Math.max(13,16*scale)}px system-ui,sans-serif`;const text=a.error?"認識できませんでした":`${a.expression} = ${a.answer}`;
+    const w=ctx.measureText(text).width+20,h=Math.max(28,32*scale);ctx.fillStyle=a.error?"#fff0ee":"#e5f7eb";ctx.strokeStyle=a.error?"#f3b3a9":"#a9e0ba";ctx.lineWidth=1;roundRect(ctx,p.x,p.y,w,h,9);ctx.fill();ctx.stroke();ctx.fillStyle=a.error?"#9f3025":"#176b42";ctx.fillText(text,p.x+10,p.y+h*.67);ctx.restore();}
+}
+function drawStroke(s){if(!s.points||!s.points.length)return;ctx.save();ctx.strokeStyle=s.erase?"#fff":(s.color||COLORS.ink);ctx.lineWidth=s.erase?Math.max(20,s.width||26):(s.width||3.2);ctx.lineCap="round";ctx.lineJoin="round";ctx.beginPath();ctx.moveTo(s.points[0].x,s.points[0].y);for(let i=1;i<s.points.length;i++){const p=s.points[i];ctx.lineTo(p.x,p.y)}if(s.points.length===1){ctx.lineTo(s.points[0].x+.1,s.points[0].y+.1)}ctx.stroke();ctx.restore();}
+function roundRect(c,x,y,w,h,r){c.beginPath();c.moveTo(x+r,y);c.arcTo(x+w,y,x+w,y+h,r);c.arcTo(x+w,y+h,x,y+h,r);c.arcTo(x,y+h,x,y,r);c.arcTo(x,y,x+w,y,r);c.closePath();}
+function getPos(e){const r=canvas.getBoundingClientRect();return{x:e.clientX-r.left,y:e.clientY-r.top};}
+function eraseAt(p){const w=screenToWorld(p.x,p.y),radius=22/scale;let idx=-1,best=Infinity;
+  strokes.forEach((s,i)=>s.points.forEach(q=>{const d=Math.hypot(q.x-w.x,q.y-w.y);if(d<radius&&d<best){best=d;idx=i;}}));
+  if(idx>=0){saveHistory();const removed=strokes[idx];strokes.splice(idx,1);answers=answers.filter(a=>a.strokeId!==removed.id);draw();}}
+function pointerDown(e){
+  e.preventDefault();canvas.setPointerCapture(e.pointerId);const p=getPos(e);pointerMap.set(e.pointerId,p);
+  if(pointerMap.size===2){current=null;pinchStart={distance:dist([...pointerMap.values()][0],[...pointerMap.values()][1]),scale,offsetX,offsetY,center:mid([...pointerMap.values()][0],[...pointerMap.values()][1])};draw();return;}
+  if(tool==="hand"){lastPoint=p;canvas.style.cursor="grabbing";return;}
+  if(tool==="erase"){eraseAt(p);lastPoint=p;return;}
+  saveHistory();const w=screenToWorld(p.x,p.y);current={id:crypto.randomUUID?crypto.randomUUID():String(Date.now()+Math.random()),points:[w],width:3.2/scale,color:COLORS.ink,created:Date.now()};
+  draw();
+}
+function pointerMove(e){
+  if(!pointerMap.has(e.pointerId))return;const p=getPos(e),old=pointerMap.get(e.pointerId);pointerMap.set(e.pointerId,p);
+  if(pointerMap.size>=2&&pinchStart){const pts=[...pointerMap.values()],center=mid(pts[0],pts[1]),d=dist(pts[0],pts[1]);const newScale=clamp(pinchStart.scale*d/Math.max(1,pinchStart.distance),.25,4);
+    const anchor=screenToWorld(pinchStart.center.x,pinchStart.center.y);scale=newScale;offsetX=center.x-anchor.x*scale;offsetY=center.y-anchor.y*scale;draw();return;}
+  if(tool==="hand"&&lastPoint){offsetX+=p.x-lastPoint.x;offsetY+=p.y-lastPoint.y;lastPoint=p;draw();return;}
+  if(tool==="erase"&&e.buttons){eraseAt(p);return;}
+  if(current){const w=screenToWorld(p.x,p.y);const prev=current.points[current.points.length-1];if(Math.hypot(w.x-prev.x,w.y-prev.y)>.5/scale)current.points.push(w);draw();}
+}
+function pointerUp(e){
+  pointerMap.delete(e.pointerId);
+  if(pointerMap.size<2)pinchStart=null;
+  if(current&&pointerMap.size===0){if(current.points.length){strokes.push(current);const added=current;current=null;draw();scheduleRecognition(added);}else current=null;}
+  lastPoint=null;if(tool==="hand")canvas.style.cursor="grab";
+}
+function dist(a,b){return Math.hypot(a.x-b.x,a.y-b.y)}function mid(a,b){return{x:(a.x+b.x)/2,y:(a.y+b.y)/2}}function clamp(v,a,b){return Math.max(a,Math.min(b,v))}
+canvas.addEventListener("pointerdown",pointerDown);canvas.addEventListener("pointermove",pointerMove);canvas.addEventListener("pointerup",pointerUp);canvas.addEventListener("pointercancel",pointerUp);
+canvas.addEventListener("wheel",e=>{e.preventDefault();const p=getPos(e),anchor=screenToWorld(p.x,p.y);scale=clamp(scale*Math.exp(-e.deltaY*.001),.25,4);offsetX=p.x-anchor.x*scale;offsetY=p.y-anchor.y*scale;draw();},{passive:false});
+function scheduleRecognition(stroke){
+  clearTimeout(recognitionTimer);const myGeneration=++generation;
+  recognitionTimer=setTimeout(()=>recognizeStroke(stroke,myGeneration),1100);
+}
+async function recognizeStroke(stroke,gen){
+  if(!engineReady){setStatus("<strong>認識モデル待機中</strong> モデルを配置して再読み込みしてください");return;}
+  if(!stroke||stroke.points.length<3)return;
+  setStatus("<strong>認識中…</strong> 数式を解析しています");
+  try{
+    // One short pause-delimited expression is recognized at a time.
+    const input=preprocessStrokes([strokeForModel(stroke)]);
+    const result=await engine.recognize(input,vocab,"number");
+    if(gen!==generation)return;
+    const latex=(result.latex||"").trim();
+    const parsed=calculateLatex(latex);
+    const box=bounds(stroke.points);
+    const answer={strokeId:stroke.id,x:box.maxX+18,y:box.minY,expression:parsed.display||latex,answer:parsed.ok?parsed.answer:"",error:!parsed.ok};
+    answers=answers.filter(a=>a.strokeId!==stroke.id);answers.push(answer);draw();
+    setStatus(parsed.ok?`<strong>認識完了</strong> ${escapeHtml(parsed.display)} = ${escapeHtml(String(parsed.answer))}`:`<strong>認識結果</strong> ${escapeHtml(latex||"（空）")} — 計算できません。数字と演算子を確認してください。`);
+  }catch(err){console.error(err);setStatus("<strong>認識エラー</strong> "+escapeHtml(err.message||String(err)));}
+}
+function strokeForModel(s){const b=bounds(s.points);return{points:s.points.map(p=>({x:p.x-b.minX+8,y:p.y-b.minY+8})),lineWidth:s.width||3};}
+function bounds(points){return{minX:Math.min(...points.map(p=>p.x)),minY:Math.min(...points.map(p=>p.y)),maxX:Math.max(...points.map(p=>p.x)),maxY:Math.max(...points.map(p=>p.y))};}
+function calculateLatex(latex){
+  let s=latex.replace(/\\times|\\cdot/g,"*").replace(/\\div/g,"/").replace(/\\plus/g,"+").replace(/−/g,"-").replace(/[×·]/g,"*").replace(/÷/g,"/");
+  s=s.replace(/\\left|\\right/g,"").replace(/\\,/g,"").replace(/[{}]/g,"");
+  s=s.replace(/\\frac\s*([0-9.]+)\s*([0-9.]+)/g,"($1/$2)");
+  s=s.replace(/\\frac\s*([0-9.]+)\s*\/\s*([0-9.]+)/g,"($1/$2)");
+  s=s.replace(/\\frac/g,"/");
+  s=s.replace(/\\,/g,"").replace(/\s+/g,"").replace(/,/g,".");
+  // Convert only simple arithmetic syntax; no eval.
+  const tokens=s.match(/(?:\d+(?:\.\d*)?|\.\d+|[()+\-*/])/g);
+  if(!tokens||tokens.join("")!==s||tokens.length>100)return{ok:false,display:s};
+  let i=0;
+  function expr(){let v=term();while(tokens[i]==="+"||tokens[i]==="-"){const op=tokens[i++],r=term();v=op==="+"?v+r:v-r;}return v;}
+  function term(){let v=factor();while(tokens[i]==="*"||tokens[i]==="/"){const op=tokens[i++],r=factor();if(op==="/"&&r===0)throw Error("0除算");v=op==="*"?v*r:v/r;}return v;}
+  function factor(){if(tokens[i]==="+"){i++;return factor()}if(tokens[i]==="-"){i++;return-factor()}if(tokens[i]==="("){i++;const v=expr();if(tokens[i++]!==")")throw Error("括弧");return v;}const t=tokens[i++];if(!t||!/^(\d+\.?\d*|\.\d+)$/.test(t))throw Error("数値");return Number(t);}
+  try{const v=expr();if(i!==tokens.length||!Number.isFinite(v))return{ok:false,display:s};return{ok:true,display:s,answer:Number(v.toPrecision(10)).toString()};}catch{return{ok:false,display:s};}
+}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+$("penBtn").onclick=()=>setTool("pen");$("eraseBtn").onclick=()=>setTool("erase");$("handBtn").onclick=()=>setTool("hand");
+$("undoBtn").onclick=undo;$("redoBtn").onclick=redo;
+$("clearBtn").onclick=()=>{if(!strokes.length&&!answers.length)return;if(confirm("ボードをすべて消去しますか？")){saveHistory();strokes=[];answers=[];draw();setStatus("<strong>消去しました</strong>");}};
+$("zoomIn").onclick=()=>zoomAt(boardWidth/2,boardHeight/2,1.2);$("zoomOut").onclick=()=>zoomAt(boardWidth/2,boardHeight/2,1/1.2);
+$("zoomReset").onclick=()=>{scale=1;offsetX=0;offsetY=0;draw();};
+function zoomAt(x,y,f){const a=screenToWorld(x,y);scale=clamp(scale*f,.25,4);offsetX=x-a.x*scale;offsetY=y-a.y*scale;draw();}
+function data(){return{format:"math-board-v1",savedAt:new Date().toISOString(),strokes,answers,view:{scale,offsetX,offsetY}};}
+function loadData(d){if(!d||!Array.isArray(d.strokes))throw Error("ファイル形式が違います");saveHistory();strokes=d.strokes;answers=Array.isArray(d.answers)?d.answers:[];if(d.view){scale=d.view.scale||1;offsetX=d.view.offsetX||0;offsetY=d.view.offsetY||0;}draw();}
+$("saveBtn").onclick=()=>{try{localStorage.setItem("math-board-save",JSON.stringify(data()));setStatus("<strong>保存しました</strong> このブラウザ内に保存しました");}catch(e){setStatus("<strong>保存失敗</strong> "+escapeHtml(e.message));}};
+$("loadBtn").onclick=()=>{try{const s=localStorage.getItem("math-board-save");if(!s){setStatus("<strong>保存データがありません</strong>");return;}loadData(JSON.parse(s));setStatus("<strong>読み込みました</strong>");}catch(e){setStatus("<strong>読込失敗</strong> "+escapeHtml(e.message));}};
+$("exportBtn").onclick=()=>download("math-board.json",JSON.stringify(data(),null,2),"application/json");
+$("importFile").onchange=async e=>{const f=e.target.files[0];if(!f)return;try{loadData(JSON.parse(await f.text()));setStatus("<strong>JSONを読み込みました</strong>");}catch(err){alert("読み込みに失敗しました: "+err.message)}e.target.value="";};
+function download(name,content,type){const a=document.createElement("a"),u=URL.createObjectURL(new Blob([content],{type}));a.href=u;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(u),1000);}
+async function initRecognition(){
+  try{
+    setStatus("<strong>認識ライブラリを読み込み中…</strong>");
+    const lib=await import("https://esm.sh/ink-on/core");
+    const {InferenceEngine,preprocessStrokes,loadVocab}=lib;
+    window.preprocessStrokes=preprocessStrokes;
+    vocab=await loadVocab(new URL("vocab.json",MODEL_BASE).href);
+    engine=new InferenceEngine({encoderUrl:new URL("encoder_int8.onnx",MODEL_BASE).href,decoderUrl:new URL("decoder_int8.onnx",MODEL_BASE).href,beamWidth:2,executionProvider:"wasm"});
+    await engine.init();engineReady=true;
+    setStatus("<strong>準備完了</strong> 数式を書いて少し待ってください");
+  }catch(err){
+    console.error(err);$("modelNotice").style.display="flex";$("modelError").textContent="認識エンジンまたはモデルを読み込めませんでした: "+(err.message||String(err));
+    setStatus("<strong>描画できます</strong> 認識モデルの設定が必要です");
+  }
+}
+draw();initRecognition();
+</script>
+</body>
+</html>
