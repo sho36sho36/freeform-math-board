@@ -66,6 +66,7 @@ const MODEL_BASE = new URL("./models/comer/", location.href).href;
 let engine = null, vocab = null, engineReady = false;
 let strokes = [], answers = [], undoStack = [], redoStack = [];
 let current = null, tool = "pen", scale = 1, offsetX = 0, offsetY = 0;
+let pendingStrokes = [], preprocessStrokesFn = null;
 let pointerMap = new Map(), pinchStart = null, lastPoint = null, recognitionTimer = null, generation = 0;
 let boardWidth = 0, boardHeight = 0;
 const COLORS = {ink:"#202638", answer:"#2b9a65", pending:"#8a91a5"};
@@ -114,7 +115,7 @@ function roundRect(c,x,y,w,h,r){c.beginPath();c.moveTo(x+r,y);c.arcTo(x+w,y,x+w,
 function getPos(e){const r=canvas.getBoundingClientRect();return{x:e.clientX-r.left,y:e.clientY-r.top};}
 function eraseAt(p){const w=screenToWorld(p.x,p.y),radius=22/scale;let idx=-1,best=Infinity;
   strokes.forEach((s,i)=>s.points.forEach(q=>{const d=Math.hypot(q.x-w.x,q.y-w.y);if(d<radius&&d<best){best=d;idx=i;}}));
-  if(idx>=0){saveHistory();const removed=strokes[idx];strokes.splice(idx,1);answers=answers.filter(a=>a.strokeId!==removed.id);draw();}}
+  if(idx>=0){saveHistory();const removed=strokes[idx];strokes.splice(idx,1);answers=answers.filter(a=>!(a.strokeIds||[a.strokeId]).includes(removed.id));draw();}}
 function pointerDown(e){
   e.preventDefault();canvas.setPointerCapture(e.pointerId);const p=getPos(e);pointerMap.set(e.pointerId,p);
   if(pointerMap.size===2){current=null;pinchStart={distance:dist([...pointerMap.values()][0],[...pointerMap.values()][1]),scale,offsetX,offsetY,center:mid([...pointerMap.values()][0],[...pointerMap.values()][1])};draw();return;}
@@ -141,27 +142,60 @@ function dist(a,b){return Math.hypot(a.x-b.x,a.y-b.y)}function mid(a,b){return{x
 canvas.addEventListener("pointerdown",pointerDown);canvas.addEventListener("pointermove",pointerMove);canvas.addEventListener("pointerup",pointerUp);canvas.addEventListener("pointercancel",pointerUp);
 canvas.addEventListener("wheel",e=>{e.preventDefault();const p=getPos(e),anchor=screenToWorld(p.x,p.y);scale=clamp(scale*Math.exp(-e.deltaY*.001),.25,4);offsetX=p.x-anchor.x*scale;offsetY=p.y-anchor.y*scale;draw();},{passive:false});
 function scheduleRecognition(stroke){
-  clearTimeout(recognitionTimer);const myGeneration=++generation;
-  recognitionTimer=setTimeout(()=>recognizeStroke(stroke,myGeneration),1100);
+  pendingStrokes.push(stroke); clearTimeout(recognitionTimer); const myGeneration=++generation;
+  recognitionTimer=setTimeout(()=>{pendingStrokes=[];recognizeNearbyExpression(stroke,myGeneration);},1800);
 }
-async function recognizeStroke(stroke,gen){
+function strokeBounds(stroke){return bounds(stroke.points);}
+function boxesAreNear(a,b){
+  const horizontalGap=Math.max(0,a.minX-b.maxX,b.minX-a.maxX);
+  const verticalGap=Math.max(0,a.minY-b.maxY,b.minY-a.maxY);
+  // Join nearby strokes into an expression, including the two separate strokes of +.
+  return horizontalGap <= 135 && verticalGap <= 100;
+}
+function nearbyCluster(seed){
+  const found=new Set([seed.id]); let changed=true;
+  while(changed){changed=false;
+    const current=strokes.filter(s=>found.has(s.id));
+    for(const candidate of strokes){
+      if(found.has(candidate.id))continue;
+      const cb=strokeBounds(candidate);
+      if(current.some(s=>boxesAreNear(strokeBounds(s),cb))){found.add(candidate.id);changed=true;}
+    }
+  }
+  return strokes.filter(s=>found.has(s.id));
+}
+function recognizeNearbyExpression(stroke,gen){
+  const batch=nearbyCluster(stroke);
+  // Remove stale partial answers for strokes now being recognized as one expression.
+  const ids=batch.map(s=>s.id);
+  answers=answers.filter(a=>!(a.strokeIds||[a.strokeId]).some(id=>ids.includes(id)));
+  draw();
+  recognizeBatch(batch,gen);
+}
+async function recognizeBatch(batch,gen){
   if(!engineReady){setStatus("<strong>認識モデル待機中</strong> モデルを配置して再読み込みしてください");return;}
-  if(!stroke||stroke.points.length<3)return;
+  batch=batch.filter(s=>s&&s.points.length>=2); if(!batch.length)return;
   setStatus("<strong>認識中…</strong> 数式を解析しています");
   try{
-    // One short pause-delimited expression is recognized at a time.
-    const input=preprocessStrokes([strokeForModel(stroke)]);
+    // Combine strokes written during the same pause window into one expression.
+    const allPoints=batch.flatMap(s=>s.points), box=bounds(allPoints);
+    const modelStrokes=batch.map(s=>({points:s.points.map(p=>({x:p.x-box.minX+8,y:p.y-box.minY+8})),lineWidth:s.width||3}));
+    const input=preprocessStrokesFn(modelStrokes);
     const result=await engine.recognize(input,vocab,"number");
     if(gen!==generation)return;
-    const latex=(result.latex||"").trim();
-    const parsed=calculateLatex(latex);
-    const box=bounds(stroke.points);
-    const answer={strokeId:stroke.id,x:box.maxX+18,y:box.minY,expression:parsed.display||latex,answer:parsed.ok?parsed.answer:"",error:!parsed.ok};
-    answers=answers.filter(a=>a.strokeId!==stroke.id);answers.push(answer);draw();
+    const latex=(result.latex||"").trim(); const parsed=calculateLatex(latex);
+    const ids=batch.map(s=>s.id);
+    // A lone digit (for example, just the first 9) is not an equation: never show 9 = 9.
+    const hasBinaryOperator=/(?:\d|\))\s*[+*/-]\s*(?:\d|\()/.test(parsed.display||"");
+    if(!hasBinaryOperator){
+      answers=answers.filter(a=>!(a.strokeIds||[a.strokeId]).some(id=>ids.includes(id)));draw();
+      setStatus(`<strong>数式を待っています</strong> ${escapeHtml(latex||"数字を認識できませんでした")} — 演算子と次の数字も書いてください。`);return;
+    }
+    const answer={strokeId:ids[0],strokeIds:ids,x:box.maxX+18,y:box.minY,expression:parsed.display||latex,answer:parsed.ok?parsed.answer:"",error:!parsed.ok};
+    answers=answers.filter(a=>!(a.strokeIds||[a.strokeId]).some(id=>ids.includes(id)));answers.push(answer);draw();
     setStatus(parsed.ok?`<strong>認識完了</strong> ${escapeHtml(parsed.display)} = ${escapeHtml(String(parsed.answer))}`:`<strong>認識結果</strong> ${escapeHtml(latex||"（空）")} — 計算できません。数字と演算子を確認してください。`);
   }catch(err){console.error(err);setStatus("<strong>認識エラー</strong> "+escapeHtml(err.message||String(err)));}
 }
-function strokeForModel(s){const b=bounds(s.points);return{points:s.points.map(p=>({x:p.x-b.minX+8,y:p.y-b.minY+8})),lineWidth:s.width||3};}
 function bounds(points){return{minX:Math.min(...points.map(p=>p.x)),minY:Math.min(...points.map(p=>p.y)),maxX:Math.max(...points.map(p=>p.x)),maxY:Math.max(...points.map(p=>p.y))};}
 function calculateLatex(latex){
   let s=latex.replace(/\\times|\\cdot/g,"*").replace(/\\div/g,"/").replace(/\\plus/g,"+").replace(/−/g,"-").replace(/[×·]/g,"*").replace(/÷/g,"/");
@@ -198,7 +232,7 @@ async function initRecognition(){
     setStatus("<strong>認識ライブラリを読み込み中…</strong>");
     const lib=await import("https://esm.sh/ink-on/core");
     const {InferenceEngine,preprocessStrokes,loadVocab}=lib;
-    window.preprocessStrokes=preprocessStrokes;
+    preprocessStrokesFn=preprocessStrokes;
     vocab=await loadVocab(new URL("vocab.json",MODEL_BASE).href);
     engine=new InferenceEngine({encoderUrl:new URL("encoder_int8.onnx",MODEL_BASE).href,decoderUrl:new URL("decoder_int8.onnx",MODEL_BASE).href,beamWidth:2,executionProvider:"wasm"});
     await engine.init();engineReady=true;
